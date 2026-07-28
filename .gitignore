@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Django
+*.log
+db.sqlite3
+/backend/media/
+/backend/staticfiles/
+/backend/backups/
+
+# Environnement
+.env
+.env.local
+
+# Node
+node_modules/
+.next/
+dist/
+
+# Éditeurs / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

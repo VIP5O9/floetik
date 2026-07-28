@@ -1,0 +1,8 @@
+Django==5.2.7
+django-ninja==1.4.3
+psycopg[binary]==3.2.10
+# Requis par les ImageField de Django (couvertures de série).
+# Plus utilisé pour générer des images : décision du 27/07/2026.
+Pillow==11.3.0
+django-environ==0.12.0
+python-slugify==8.0.4

@@ -10,7 +10,9 @@ import re
 
 from django.contrib.postgres.indexes import GinIndex
 from django.core.exceptions import ValidationError
+from django.core.validators import MinValueValidator
 from django.db import models
+from django.dispatch import receiver
 from django.utils import timezone
 from slugify import slugify
 
@@ -172,6 +174,20 @@ class Series(models.Model):
         return nxt.published_at if nxt else None
 
 
+@receiver(models.signals.pre_delete, sender=Series)
+def _detacher_les_episodes(sender, instance, **kwargs):
+    """Supprimer une série efface aussi le n° d'épisode de ses textes.
+
+    Le lien vers la série passe à NULL (on_delete=SET_NULL) mais le numéro, lui,
+    restait : le public lisait « épisode 1 » d'une série qui n'existe plus, et la
+    fiche ne pouvait plus jamais être enregistrée, clean() exigeant une série pour
+    tout numéro d'épisode. Branché sur pre_delete, donc valable aussi pour une
+    suppression en lot (Series.objects.filter(...).delete()), qui n'appelle pas
+    Series.delete().
+    """
+    instance.texts.update(episode_no=None)
+
+
 class TextQuerySet(models.QuerySet):
     def live(self):
         """Publié ET la date est passée. Un épisode programmé pour dans 2 jours
@@ -209,7 +225,15 @@ class Text(models.Model):
         Series, related_name="texts", on_delete=models.SET_NULL,
         null=True, blank=True, verbose_name="série",
     )
-    episode_no = models.PositiveIntegerField("n° d'épisode", null=True, blank=True)
+    # La numérotation commence à 1 : un « épisode 0 » (prologue) serait légal
+    # pour un PositiveIntegerField, mais 0 est faux en Python et traverserait
+    # sans bruit les conditions d'entrée du garde-fou d'ordre. Un prologue est
+    # l'épisode 1.
+    episode_no = models.PositiveIntegerField(
+        "n° d'épisode", null=True, blank=True,
+        validators=[MinValueValidator(1, "La numérotation des épisodes commence à 1.")],
+        help_text="Laissé vide hors série. Un prologue est l'épisode 1, pas l'épisode 0.",
+    )
 
     status = models.CharField(
         "état", max_length=12, choices=Status.choices, default=Status.DRAFT
@@ -279,9 +303,18 @@ class Text(models.Model):
         La dernière est la plus vicieuse : tout paraît normal en base, et le
         lecteur découvre la suite avant le début.
         """
-        if self.episode_no and not self.series:
-            raise ValidationError({"series": "Un numéro d'épisode exige une série."})
-        if not (self.series and self.episode_no and self.status == Status.PUBLISHED):
+        # `is not None` et non la simple vérité : 0 est faux en Python, et un
+        # épisode numéroté 0 sortirait d'ici sans avoir été contrôlé.
+        if self.episode_no is not None and not self.series:
+            raise ValidationError(
+                {"series": "Un numéro d'épisode exige une série : choisissez une "
+                           "série, ou videz le n° d'épisode."}
+            )
+        if not (
+            self.series
+            and self.episode_no is not None
+            and self.status == Status.PUBLISHED
+        ):
             return
 
         precedents = self.series.texts.filter(
@@ -297,11 +330,14 @@ class Text(models.Model):
                                f"l'épisode {_liste(absents)} n'existe pas encore."}
             )
 
-        # b) Aucun précédent en brouillon ou archivé.
+        # b) Aucun précédent en brouillon, archivé — ou sans date de parution.
+        # Un « publié » sans date n'est jamais servi (is_live reste faux), et les
+        # comparaisons SQL du point c) ignorent les NULL : sans ce filtre, la
+        # suite paraîtrait devant une ouverture que personne ne peut lire.
         en_attente = sorted(
-            precedents.exclude(status=Status.PUBLISHED).values_list(
-                "episode_no", flat=True
-            )
+            precedents.filter(
+                ~models.Q(status=Status.PUBLISHED) | models.Q(published_at__isnull=True)
+            ).values_list("episode_no", flat=True)
         )
         if en_attente:
             raise ValidationError(

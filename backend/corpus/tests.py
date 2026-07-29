@@ -407,6 +407,117 @@ class PublierMaintenantTests(TestCase):
         self.assertEqual(ep2.status, Status.PUBLISHED)
 
 
+class EpisodeSansDateTests(TestCase):
+    """Un épisode « publié » sans date de parution n'est jamais servi (is_live
+    reste faux à jamais). La suite ne doit donc pas pouvoir paraître devant lui :
+    le lecteur aurait le deuxième épisode et pas le premier."""
+
+    def setUp(self):
+        self.series = Series.objects.create(
+            title="Lapli", kind=SeriesKind.STORY_SERIES, language=Language.HT
+        )
+
+    def test_sequel_cannot_be_published_while_the_opener_has_no_date(self):
+        ouverture = make_text(
+            kind=Kind.STORY,
+            title="Lapli epizòd 1",
+            series=self.series,
+            episode_no=1,
+            published_at=timezone.now() - timedelta(days=2),
+        )
+        # Date effacée hors save() — bulk update, import, migration de données.
+        Text.objects.filter(pk=ouverture.pk).update(published_at=None)
+        self.assertEqual(
+            self.client.get(f"/api/v1/tex/{ouverture.slug}").status_code,
+            404,
+            "l'ouverture sans date ne devrait pas être servie",
+        )
+
+        with self.assertRaises(ValidationError):
+            make_text(
+                kind=Kind.STORY,
+                title="Lapli epizòd 2",
+                series=self.series,
+                episode_no=2,
+                published_at=timezone.now() - timedelta(days=1),
+            )
+
+        sommaire = self.client.get(f"/api/v1/seri/{self.series.slug}").json()
+        self.assertEqual(
+            [e["episode_no"] for e in sommaire["episodes"] if e["is_available"]], []
+        )
+
+
+class EpisodeZeroTests(TestCase):
+    """La numérotation des épisodes commence à 1. Un « épisode 0 » — le prologue
+    d'un romancier — est refusé plutôt qu'ignoré : sinon il traverse les deux
+    conditions d'entrée du garde-fou (0 est faux) et paraît hors de tout ordre."""
+
+    def test_a_text_numbered_zero_cannot_be_saved_without_a_series(self):
+        with self.assertRaises(ValidationError):
+            make_text(title="Pwològ", episode_no=0)
+
+    def test_a_prologue_numbered_zero_never_reaches_the_sommaire(self):
+        series = Series.objects.create(
+            title="Sezon pwològ", kind=SeriesKind.STORY_SERIES, language=Language.HT
+        )
+        make_text(
+            kind=Kind.STORY,
+            title="Epizòd 5",
+            series=series,
+            episode_no=5,
+            status=Status.DRAFT,
+            published_at=None,
+        )
+        with self.assertRaises(ValidationError):
+            make_text(
+                kind=Kind.STORY,
+                title="Pwològ",
+                series=series,
+                episode_no=0,
+                published_at=timezone.now() + timedelta(days=99),
+            )
+        self.assertEqual(self.client.get(f"/api/v1/seri/{series.slug}").status_code, 404)
+
+
+class SuppressionSerieTests(TestCase):
+    """Supprimer une série détache ses textes : la série passe à NULL (SET_NULL),
+    le n° d'épisode doit suivre. Sinon le public lit « épisode 1 de rien », et la
+    fiche devient impossible à réenregistrer depuis l'admin."""
+
+    def setUp(self):
+        self.series = Series.objects.create(
+            title="Woman ki disparèt", kind=SeriesKind.STORY_SERIES, language=Language.HT
+        )
+        self.chapitre = make_text(
+            kind=Kind.STORY,
+            title="Chapit youn",
+            series=self.series,
+            episode_no=1,
+            published_at=timezone.now() - timedelta(days=1),
+        )
+
+    def test_deleted_series_is_never_served_as_episode_of_nothing(self):
+        self.series.delete()
+        body = self.client.get(f"/api/v1/tex/{self.chapitre.slug}").json()
+        self.assertEqual(body["title"], "Chapit youn")
+        self.assertIsNone(body["series"])
+        self.assertIsNone(body["episode_no"])
+
+    def test_text_can_still_be_edited_after_its_series_is_deleted(self):
+        self.series.delete()
+        orphelin = Text.objects.get(pk=self.chapitre.pk)
+        orphelin.title = "Chapit youn — revize"
+        orphelin.save()
+        self.assertEqual(
+            Text.objects.get(pk=self.chapitre.pk).title, "Chapit youn — revize"
+        )
+
+    def test_bulk_deletion_of_series_detaches_its_texts_too(self):
+        Series.objects.filter(pk=self.series.pk).delete()
+        self.assertIsNone(Text.objects.get(pk=self.chapitre.pk).episode_no)
+
+
 class RelatedTextsLimitTests(TestCase):
     def setUp(self):
         self.text = make_text()

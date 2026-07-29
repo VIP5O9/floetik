@@ -6,17 +6,19 @@ Chaque test reproduit un bug identifié dans ROADMAP.md avant de le corriger.
 
 import json
 import tempfile
+import threading
 import unittest
 from datetime import timedelta
 from pathlib import Path
 
 from django.contrib.admin.sites import AdminSite
+from django.contrib.auth import get_user_model
 from django.contrib.messages.storage.fallback import FallbackStorage
 from django.core.cache import cache
 from django.core.exceptions import ValidationError
 from django.core.management import call_command
 from django.db import connection
-from django.test import RequestFactory, TestCase
+from django.test import Client, RequestFactory, TestCase, TransactionTestCase
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
@@ -598,3 +600,199 @@ class PaginationCeilingTests(TestCase):
             len(limit_params), 1, f"paramètre limit introuvable parmi {params}"
         )
         self.assertEqual(limit_params[0]["schema"].get("maximum"), 100)
+class SlugTranslitterationTests(TestCase):
+    """Certains alphabets gonflent à la translittération : « ж » devient « zh »,
+    « 龍 » devient « long ». Un titre de 200 caractères peut produire un slug de
+    999 caractères, que la colonne (220) ne peut pas accueillir."""
+
+    def test_titre_cyrillique_de_200_caracteres_produit_un_slug_valide(self):
+        texte = make_text(title="ж" * 200)
+        self.assertTrue(texte.slug)
+        self.assertLessEqual(len(texte.slug), 220)
+        self.assertEqual(Text.objects.get(slug=texte.slug).pk, texte.pk)
+
+    def test_deux_titres_cjk_identiques_recoivent_des_slugs_courts_et_distincts(self):
+        premier = make_text(title="龍" * 200)
+        second = make_text(title="龍" * 200)
+        self.assertNotEqual(premier.slug, second.slug)
+        self.assertLessEqual(len(second.slug), 220)
+
+
+def payload_admin_texte(**kwargs):
+    """Le POST que le navigateur envoie sur /admin/corpus/text/add/."""
+    donnees = {
+        "kind": Kind.POEM,
+        "language": Language.HT,
+        "format": "",
+        "title": "Yon tit",
+        "slug": "",
+        "body": "Yon vè\nYon lòt vè",
+        "excerpt": "",
+        "themes": [],
+        "series": "",
+        "episode_no": "",
+        "status": Status.DRAFT,
+        "published_at_0": "",
+        "published_at_1": "",
+        "audio-TOTAL_FORMS": "0",
+        "audio-INITIAL_FORMS": "0",
+        "audio-MIN_NUM_FORMS": "0",
+        "audio-MAX_NUM_FORMS": "1",
+    }
+    donnees.update(kwargs)
+    return donnees
+
+
+class AdminEnregistrementTexteTests(TestCase):
+    """Le seam public de l'admin : POST sur /admin/corpus/text/add/.
+    Une erreur de formulaire est acceptable, une 500 nue ne l'est jamais."""
+
+    def setUp(self):
+        User = get_user_model()
+        self.user = User.objects.create_superuser(
+            username="florentz", email="f@example.com", password="mot-de-passe-test"
+        )
+        self.client.force_login(self.user)
+
+    def test_titre_cjk_de_200_caracteres_ne_provoque_pas_de_500(self):
+        response = self.client.post(
+            "/admin/corpus/text/add/", payload_admin_texte(title="龍" * 200)
+        )
+        self.assertIn(response.status_code, (200, 302), "500 nue sur l'ajout d'un texte")
+        self.assertEqual(response.status_code, 302, "le texte aurait dû être créé")
+        texte = Text.objects.get()
+        self.assertTrue(texte.slug)
+        self.assertLessEqual(len(texte.slug), 220)
+
+
+class SlugHomonymesTests(TestCase):
+    """Le choix du slug ne doit pas coûter une requête par homonyme : sinon
+    enregistrer devient de plus en plus lent à mesure que le corpus grossit."""
+
+    def _requetes_pour_creer_un_homonyme(self):
+        with CaptureQueriesContext(connection) as ctx:
+            make_text(title="Sanzatann")
+        nb = len(ctx.captured_queries)
+        self.assertGreater(nb, 0, "aucune requête capturée : le compteur ne mesure rien")
+        return nb
+
+    def test_le_nombre_de_requetes_ne_croit_pas_avec_le_nombre_dhomonymes(self):
+        for _ in range(3):
+            make_text(title="Sanzatann")
+        avec_3 = self._requetes_pour_creer_un_homonyme()
+
+        for _ in range(30):
+            make_text(title="Sanzatann")
+        avec_34 = self._requetes_pour_creer_un_homonyme()
+
+        self.assertEqual(
+            avec_34,
+            avec_3,
+            f"coût du slug linéaire en homonymes : {avec_3} requêtes avec 3 homonymes, "
+            f"{avec_34} avec 34",
+        )
+
+    def test_les_homonymes_recoivent_des_slugs_distincts_et_numerotes(self):
+        premier = make_text(title="Sanzatann")
+        deuxieme = make_text(title="Sanzatann")
+        troisieme = make_text(title="Sanzatann")
+        self.assertEqual(premier.slug, "sanzatann")
+        self.assertEqual(deuxieme.slug, "sanzatann-2")
+        self.assertEqual(troisieme.slug, "sanzatann-3")
+
+
+class SlugConcurrenceTests(TransactionTestCase):
+    """Un « Enregistrer » double-cliqué, ou deux onglets d'admin ouverts, font
+    deux INSERT simultanés avec le même slug calculé.
+
+    TransactionTestCase (et non TestCase) est indispensable : chaque thread a sa
+    propre connexion et doit voir les COMMIT des autres, ce que l'isolation en
+    transaction unique de TestCase interdit.
+    """
+
+    NB_THREADS = 12
+
+    def test_saves_concurrents_du_meme_titre_ne_lèvent_aucune_erreur(self):
+        barriere = threading.Barrier(self.NB_THREADS)
+        resultats = []
+        verrou = threading.Lock()
+
+        def creer():
+            barriere.wait()  # tous les threads partent vraiment en même temps
+            try:
+                issue = ("ok", make_text(title="Menm tit la").slug)
+            except Exception as exc:
+                issue = ("erreur", f"{type(exc).__name__}: {exc}")
+            finally:
+                connection.close()
+            with verrou:
+                resultats.append(issue)
+
+        threads = [threading.Thread(target=creer) for _ in range(self.NB_THREADS)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        self.assertEqual(
+            len(resultats), self.NB_THREADS, "des threads n'ont rien rapporté"
+        )
+        erreurs = [message for issue, message in resultats if issue == "erreur"]
+        self.assertEqual(erreurs, [], f"enregistrements en échec : {erreurs}")
+        slugs = {valeur for issue, valeur in resultats if issue == "ok"}
+        self.assertEqual(len(slugs), self.NB_THREADS, f"slugs non distincts : {slugs}")
+        self.assertEqual(Text.objects.count(), self.NB_THREADS)
+
+    def test_ajouts_concurrents_du_meme_titre_dans_ladmin_ne_rendent_jamais_500(self):
+        User = get_user_model()
+        user = User.objects.create_superuser(
+            username="florentz", email="f@example.com", password="mot-de-passe-test"
+        )
+        barriere = threading.Barrier(self.NB_THREADS)
+        codes = []
+        verrou = threading.Lock()
+
+        def poster():
+            client = Client()
+            client.force_login(user)
+            donnees = payload_admin_texte(title="Menm tit la")
+            barriere.wait()
+            try:
+                code = client.post("/admin/corpus/text/add/", donnees).status_code
+            except Exception as exc:
+                code = f"{type(exc).__name__}: {exc}"
+            finally:
+                connection.close()
+            with verrou:
+                codes.append(code)
+
+        threads = [threading.Thread(target=poster) for _ in range(self.NB_THREADS)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        self.assertEqual(len(codes), self.NB_THREADS, "des threads n'ont rien rapporté")
+        self.assertEqual(
+            [c for c in codes if c != 302], [], f"réponses inattendues : {codes}"
+        )
+        self.assertEqual(Text.objects.count(), self.NB_THREADS)
+        self.assertEqual(
+            Text.objects.values("slug").distinct().count(), self.NB_THREADS
+        )
+
+
+class SlugStabiliteTests(TestCase):
+    """Un slug est une URL publique : une fois attribué, il ne bouge plus."""
+
+    def test_renommer_un_texte_ne_change_pas_son_slug(self):
+        texte = make_text(title="Lanmou nan lapli")
+        self.assertEqual(texte.slug, "lanmou-nan-lapli")
+        texte.title = "Yon lòt tit"
+        texte.save()
+        texte.refresh_from_db()
+        self.assertEqual(texte.slug, "lanmou-nan-lapli")
+
+    def test_le_slug_saisi_a_la_main_est_respecte(self):
+        texte = make_text(title="Sanzatann", slug="chwazi-alamen")
+        self.assertEqual(texte.slug, "chwazi-alamen")

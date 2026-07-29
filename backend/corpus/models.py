@@ -7,10 +7,11 @@ repli linguistique. Le corpus est bilingue, chaque texte ne l'est pas.
 """
 
 import re
+import secrets
 
 from django.contrib.postgres.indexes import GinIndex
 from django.core.exceptions import ValidationError
-from django.db import models
+from django.db import IntegrityError, models, transaction
 from django.utils import timezone
 from slugify import slugify
 
@@ -69,17 +70,51 @@ def _liste(nombres) -> str:
     return n[0] if len(n) == 1 else f"{', '.join(n[:-1])} et {n[-1]}"
 
 
-def unique_slug(model, title: str, instance_pk=None) -> str:
-    """Slug ASCII sans accents — « Lanmou nan lapli » → « lanmou-nan-lapli »."""
-    base = slugify(strip_markers(title)) or "tex"
-    slug, n = base, 2
-    qs = model.objects.all()
+# Place réservée au suffixe de désambiguïsation (« -12 », « -a3f9c1 ») à la fin
+# d'un slug : la base est tronquée d'autant pour que le tout tienne en colonne.
+RESERVE_SUFFIXE_SLUG = 10
+
+
+# Nombre d'essais d'écriture avant d'abandonner sur un conflit de slug. Le
+# premier essai numérote (« -2 »), les suivants tirent un suffixe au hasard :
+# deux enregistrements simultanés ne peuvent pas retomber sur le même.
+TENTATIVES_SLUG = 6
+
+
+def _est_un_conflit_de_slug(exc) -> bool:
+    """L'échec porte-t-il sur l'unicité du slug, et sur rien d'autre ?"""
+    if isinstance(exc, ValidationError):
+        return list(getattr(exc, "error_dict", {})) == ["slug"]
+    return "slug" in str(exc).lower()
+
+
+def unique_slug(model, title: str, instance_pk=None, *, aleatoire: bool = False) -> str:
+    """Slug ASCII sans accents — « Lanmou nan lapli » → « lanmou-nan-lapli ».
+
+    La base est tronquée à la taille de la colonne : la translittération gonfle
+    certains alphabets (« ж » → « zh », « 龍 » → « long »), et un titre de 200
+    caractères peut produire un slug de 999 — que la colonne ne peut pas
+    accueillir.
+    """
+    place = model._meta.get_field("slug").max_length - RESERVE_SUFFIXE_SLUG
+    base = slugify(strip_markers(title), max_length=place, word_boundary=True) or "tex"
+    if aleatoire:
+        # Reprise après collision : ne pas relire la base, deux threads y
+        # liraient la même chose et choisiraient encore le même numéro.
+        return f"{base}-{secrets.token_hex(3)}"
+    qs = model.objects.filter(slug__startswith=base)
     if instance_pk:
         qs = qs.exclude(pk=instance_pk)
-    while qs.filter(slug=slug).exists():
-        slug = f"{base}-{n}"
+    # Une seule requête, quel que soit le nombre d'homonymes : l'ancienne boucle
+    # interrogeait la base une fois par tentative — 402 requêtes pour le 402e
+    # « Sanzatann ».
+    pris = set(qs.values_list("slug", flat=True))
+    if base not in pris:
+        return base
+    n = 2
+    while f"{base}-{n}" in pris:
         n += 1
-    return slug
+    return f"{base}-{n}"
 
 
 class Theme(models.Model):
@@ -346,16 +381,35 @@ class Text(models.Model):
     def save(self, *args, **kwargs):
         if not self.format:
             self.format = default_format_for(self.kind)
-        if not self.slug:
-            self.slug = unique_slug(Text, self.title, self.pk)
         if not self.excerpt:
             self.excerpt = self.build_excerpt()
         words = len(strip_markers(self.body).split())
         self.reading_time = max(1, round(words / WORDS_PER_MINUTE))
         if self.status == Status.PUBLISHED and self.published_at is None:
             self.published_at = timezone.now()
-        self.full_clean()
-        super().save(*args, **kwargs)
+
+        # Le slug déjà fixé — texte existant, ou slug saisi à la main dans
+        # l'admin — n'est jamais recalculé : c'est une URL publique, elle doit
+        # rester stable.
+        slug_impose = bool(self.slug)
+        for tentative in range(TENTATIVES_SLUG):
+            if not slug_impose:
+                self.slug = unique_slug(
+                    Text, self.title, self.pk, aleatoire=tentative > 0
+                )
+            try:
+                # Le slug est choisi AVANT l'INSERT mais écrit APRÈS : entre les
+                # deux, un autre enregistrement peut prendre le même. On réessaie
+                # au lieu de laisser remonter une 500. Le savepoint est
+                # indispensable : sans lui la transaction resterait cassée.
+                with transaction.atomic():
+                    self.full_clean()
+                    super().save(*args, **kwargs)
+                return
+            except (IntegrityError, ValidationError) as exc:
+                dernier_essai = tentative == TENTATIVES_SLUG - 1
+                if slug_impose or dernier_essai or not _est_un_conflit_de_slug(exc):
+                    raise
 
 
 class AudioVersion(models.Model):

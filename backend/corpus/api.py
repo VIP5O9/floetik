@@ -85,6 +85,17 @@ def _base_qs():
     )
 
 
+def _card_qs():
+    """Le jeu de colonnes d'une carte de liste — sans le corps.
+
+    Une carte n'affiche que l'extrait : rapatrier le corps de chaque ligne
+    faisait transiter des centaines de kilo-octets par page pour rien. Le
+    corps reste filtrable en SQL (cheche() cherche dedans), il n'est
+    simplement pas ramené.
+    """
+    return _base_qs().defer("body")
+
+
 # ───────────────────────────── Textes ─────────────────────────────
 
 
@@ -97,7 +108,7 @@ def list_texts(
     theme: str | None = None,
     series: str | None = None,
 ):
-    qs = _base_qs()
+    qs = _card_qs()
     if lang:
         qs = qs.filter(language=lang)
     if kind:
@@ -154,7 +165,7 @@ def get_text(request, slug: str):
 def related_texts(request, slug: str, limit: int = Query(4, ge=1, le=20)):
     text = get_object_or_404(Text.objects.live(), slug=slug)
     qs = (
-        _base_qs()
+        _card_qs()
         .filter(themes__in=text.themes.all())
         .exclude(pk=text.pk)
         .distinct()[:limit]
@@ -211,7 +222,7 @@ def search(
     if len(q) < 2:
         return []
 
-    qs = _base_qs().filter(
+    qs = _card_qs().filter(
         # Correspondance directe, accents ignorés
         Q(title__unaccent__icontains=q)
         | Q(body__unaccent__icontains=q)
@@ -302,7 +313,12 @@ def get_series(request, slug: str):
     series = get_object_or_404(_visible_series_qs(), slug=slug)
 
     episodes: list[EpisodeOut] = []
-    for t in series.texts.filter(status=Status.PUBLISHED).order_by("episode_no"):
+    # .defer("body") : un sommaire n'expose que titres et dates — inutile de
+    # rapatrier le corps de chaque chapitre d'un roman pour l'afficher.
+    episodes_qs = (
+        series.texts.filter(status=Status.PUBLISHED).defer("body").order_by("episode_no")
+    )
+    for t in episodes_qs:
         if t.is_live:
             episodes.append(
                 {

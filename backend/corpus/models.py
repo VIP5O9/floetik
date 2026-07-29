@@ -24,6 +24,9 @@ GOLD_MARKER = re.compile(r"\*(?P<word>[^*\n]+)\*")
 # Volontairement basse : lecture de poésie, pas d'article de presse.
 WORDS_PER_MINUTE = 180
 
+# Longueur maximale d'un extrait, avant l'ajout du caractère de troncature.
+EXCERPT_MAX_CHARS = 220
+
 
 def strip_markers(text: str) -> str:
     """Retire les marqueurs *…* pour les usages où ils n'ont pas de sens
@@ -64,6 +67,23 @@ PLAIN_KINDS = {Kind.POEM, Kind.QUOTE}
 
 def default_format_for(kind: str) -> str:
     return Format.PLAIN if kind in PLAIN_KINDS else Format.MARKDOWN
+
+
+def _tronque(texte: str, limite: int = EXCERPT_MAX_CHARS) -> str:
+    """Borne un extrait sans couper un mot en deux.
+
+    S'applique à TOUTES les formes : un vers unique de 1700 caractères servait
+    autrefois le corps entier dans la carte de liste, ce que l'extrait n'est
+    jamais censé faire.
+    """
+    if len(texte) <= limite:
+        return texte
+    coupe = texte[:limite]
+    # Se replier sur la dernière frontière de mot ; à défaut (un « mot » plus
+    # long que la limite), couper net plutôt que de tout rendre.
+    if (espace := coupe.rstrip().rfind(" ")) > 0:
+        coupe = coupe[:espace]
+    return coupe.rstrip() + "…"
 
 
 def _liste(nombres) -> str:
@@ -199,6 +219,9 @@ class Series(models.Model):
             self.texts.filter(
                 status=Status.PUBLISHED, published_at__gt=timezone.now()
             )
+            # Seule la date est lue ici (compte à rebours) : ne pas rapatrier
+            # le corps d'un épisode qui n'est de toute façon pas encore paru.
+            .defer("body")
             .order_by("published_at")
             .first()
         )
@@ -410,14 +433,46 @@ class Text(models.Model):
         if self.format == Format.PLAIN:
             # Poésie : les deux premiers vers non vides, la forme compte.
             lines = [ln for ln in clean.splitlines() if ln.strip()]
-            return "\n".join(lines[:2])
+            return _tronque("\n".join(lines[:2]))
         flat = " ".join(clean.split())
-        return flat[:220].rsplit(" ", 1)[0] + "…" if len(flat) > 220 else flat
+        return _tronque(flat)
+
+    def _excerpt_is_stale(self) -> bool:
+        """L'extrait doit-il être régénéré depuis le corps ?
+
+        Oui s'il est vide, oui s'il avait été généré automatiquement depuis une
+        version antérieure du corps. Non s'il a été écrit à la main : corriger
+        son texte ne doit pas effacer un chapô choisi par l'auteur.
+
+        Sans ce recalcul, retirer une phrase du corps laissait l'API servir
+        l'ancienne indéfiniment — or retirer une phrase EST la rétractation.
+        """
+        if not self.excerpt:
+            return True
+        if not self.pk:
+            return False
+        ancien = (
+            Text.objects.filter(pk=self.pk)
+            .values_list("body", "excerpt", "format")
+            .first()
+        )
+        if ancien is None:
+            return False
+        body, excerpt, format_ = ancien
+        if body == self.body:
+            return False
+        # Reconstruire l'extrait tel qu'il aurait été produit pour l'ancien
+        # corps : s'il correspond, c'est bien un extrait automatique.
+        temoin = Text(body=body, format=format_)
+        return excerpt == temoin.build_excerpt() == self.excerpt
 
     def save(self, *args, **kwargs):
         if not self.format:
             self.format = default_format_for(self.kind)
-        if not self.excerpt:
+        # Le slug n'est PAS calculé ici : la boucle de reprise plus bas s'en
+        # charge, et le fixer maintenant désactiverait sa protection contre les
+        # enregistrements concurrents.
+        if self._excerpt_is_stale():
             self.excerpt = self.build_excerpt()
         words = len(strip_markers(self.body).split())
         self.reading_time = max(1, round(words / WORDS_PER_MINUTE))

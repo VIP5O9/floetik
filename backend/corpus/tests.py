@@ -1075,3 +1075,200 @@ class ReglagesHttpsTests(unittest.TestCase):
             {"DEBUG": "False", "CSRF_TRUSTED_ORIGINS": "https://floetik.ht"}
         )
         self.assertEqual(lu["valeurs"]["CSRF_TRUSTED_ORIGINS"], ["https://floetik.ht"])
+# ─────────────── Issue #6 — la carte ne livre jamais le corps ───────────────
+
+# Longueur maximale tolérée pour un extrait, toutes formes confondues.
+# Valeur choisie à la main d'après la spécification (plafond de 220 caractères
+# plus la marge du caractère de troncature), volontairement indépendante de
+# toute constante du code de production.
+EXTRAIT_MAX = 240
+
+
+class ExcerptCapTests(TestCase):
+    """Un extrait est borné, quel que soit le format du texte."""
+
+    def test_single_line_quote_yields_a_bounded_excerpt(self):
+        corps = "Mwen sonje lapli a ki t ap tonbe sou tòl la. " * 38  # ~1710 caractères
+        self.assertGreater(len(corps), 1700)
+        citation = make_text(kind=Kind.QUOTE, title="Sitasyon long", body=corps)
+
+        response = self.client.get("/api/v1/tex", {"limit": 50})
+        self.assertEqual(response.status_code, 200)
+        cartes = [c for c in response.json()["items"] if c["slug"] == citation.slug]
+        self.assertEqual(len(cartes), 1, "la citation devrait figurer dans la liste")
+
+        extrait = cartes[0]["excerpt"]
+        self.assertLessEqual(len(extrait), EXTRAIT_MAX)
+        self.assertNotIn(corps, response.content.decode())
+
+
+def _row_select_on_text(ctx):
+    """Le SELECT qui rapatrie les LIGNES de corpus_text — pas le COUNT.
+
+    Discriminé par la présence de la colonne slug dans la projection : le COUNT
+    de pagination ne la sélectionne jamais. On refuse explicitement tout
+    agrégat pour ne pas retomber sur lui par accident.
+    """
+    lignes = []
+    for q in ctx.captured_queries:
+        sql = q["sql"].strip()
+        if not sql.upper().startswith("SELECT") or "corpus_text" not in sql:
+            continue
+        if sql.upper().startswith("SELECT COUNT("):
+            continue
+        if 'corpus_text"."slug"' in _projection(sql):
+            lignes.append(sql)
+    return lignes
+
+
+def _projection(sql: str) -> str:
+    """La liste des colonnes ramenées, entre SELECT et FROM.
+
+    Chercher une colonne dans le SQL entier confondrait ce qui est RAMENÉ avec
+    ce qui est seulement FILTRÉ — cheche() filtre légitimement sur le corps.
+    """
+    return sql[: sql.upper().find(" FROM ")]
+
+
+class ListCardDoesNotSelectBodyTests(TestCase):
+    """La carte n'affiche pas le corps : la base ne doit pas le rapatrier."""
+
+    def setUp(self):
+        for _ in range(3):
+            make_text(body="Yon vè byen long\nYon lòt vè\nYon twazyèm vè")
+
+    def _assert_no_body_column(self, url, params=None):
+        with CaptureQueriesContext(connection) as ctx:
+            response = self.client.get(url, params or {})
+        self.assertEqual(response.status_code, 200)
+
+        selects = _row_select_on_text(ctx)
+        # Le sélecteur doit avoir trouvé quelque chose, sinon le test ne peut
+        # jamais échouer — c'est le piège du faux verdict.
+        self.assertTrue(
+            selects, f"aucun SELECT de lignes sur corpus_text capturé pour {url}"
+        )
+        for sql in selects:
+            tete = _projection(sql)
+            self.assertIn('corpus_text"."title"', tete, f"projection inattendue : {tete}")
+            self.assertNotIn(
+                'corpus_text"."body"', tete, f"le corps est encore sélectionné : {tete}"
+            )
+        return selects
+
+    def test_tex_row_select_omits_the_body_column(self):
+        self._assert_no_body_column("/api/v1/tex")
+
+    def test_cheche_row_select_omits_the_body_column(self):
+        self._assert_no_body_column("/api/v1/cheche", {"q": "vè"})
+
+
+class SeriesDetailDoesNotSelectBodyTests(TestCase):
+    """Un sommaire liste des titres et des dates : jamais de corps."""
+
+    def setUp(self):
+        self.series = Series.objects.create(
+            title="Woman an", kind=SeriesKind.NOVEL, language=Language.HT
+        )
+        for n in (1, 2):
+            make_text(
+                series=self.series,
+                episode_no=n,
+                published_at=timezone.now() - timedelta(days=10 - n),
+                body="Yon chapit antye ki pa gen anyen pou wè nan yon somè",
+            )
+
+    def test_seri_detail_row_select_omits_the_body_column(self):
+        with CaptureQueriesContext(connection) as ctx:
+            response = self.client.get(f"/api/v1/seri/{self.series.slug}")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()["episodes"]), 2)
+
+        selects = _row_select_on_text(ctx)
+        self.assertTrue(selects, "aucun SELECT de lignes sur corpus_text capturé")
+        for tete in map(_projection, selects):
+            self.assertIn('corpus_text"."title"', tete, f"projection inattendue : {tete}")
+            self.assertNotIn(
+                'corpus_text"."body"', tete, f"le corps est encore sélectionné : {tete}"
+            )
+
+
+class ExcerptFollowsTheBodyTests(TestCase):
+    """Retirer une phrase du texte doit la retirer de l'extrait servi."""
+
+    def test_editing_the_body_refreshes_the_served_excerpt(self):
+        premiere = "Premye vèsyon: mwen te di yon bagay mwen regrèt anpil."
+        corrigee = "Vèsyon korije: fraz la retire."
+        texte = make_text(kind=Kind.QUOTE, title="Retrè", body=premiere)
+
+        texte.body = corrigee
+        texte.save()
+
+        response = self.client.get("/api/v1/tex", {"limit": 50})
+        carte = next(c for c in response.json()["items"] if c["slug"] == texte.slug)
+        self.assertEqual(carte["excerpt"], corrigee)
+        self.assertNotIn("regrèt", response.content.decode())
+
+
+class RowSelectKeepsItsLimitTests(TestCase):
+    """Régression : retirer le corps ne doit pas faire retomber la pagination
+    en Python. Le LIMIT porte sur le SELECT de lignes lui-même."""
+
+    def setUp(self):
+        for _ in range(5):
+            make_text()
+
+    def _row_select(self, url, params):
+        with CaptureQueriesContext(connection) as ctx:
+            response = self.client.get(url, params)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()["items"]), 2)
+        selects = _row_select_on_text(ctx)
+        self.assertEqual(
+            len(selects), 1, f"un seul SELECT de lignes attendu, obtenu : {selects}"
+        )
+        return selects[0]
+
+    def test_tex_row_select_still_carries_a_limit(self):
+        sql = self._row_select("/api/v1/tex", {"limit": 2})
+        self.assertIn("LIMIT 2", sql.upper())
+
+    def test_cheche_row_select_still_carries_a_limit(self):
+        sql = self._row_select("/api/v1/cheche", {"q": "vè", "limit": 2})
+        self.assertIn("LIMIT 2", sql.upper())
+
+
+class TextDetailStillServesTheBodyTests(TestCase):
+    """La liste cache le corps ; la page du texte, elle, EST le corps."""
+
+    def test_detail_returns_the_full_body(self):
+        corps = "Premye vè a\nDezyèm vè a\nTwazyèm vè a ki pa janm nan yon kat"
+        texte = make_text(body=corps)
+
+        response = self.client.get(f"/api/v1/tex/{texte.slug}")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["body"], corps)
+
+    def test_detail_of_a_very_long_text_is_not_truncated(self):
+        corps = "Yon fraz ki repete san rete. " * 200  # 5800 caractères
+        texte = make_text(kind=Kind.QUOTE, title="Long", body=corps)
+
+        detail = self.client.get(f"/api/v1/tex/{texte.slug}").json()
+        self.assertEqual(len(detail["body"]), 5800)
+        # L'extrait de la même ressource reste borné : les deux champs ne
+        # racontent pas la même chose.
+        self.assertLessEqual(len(detail["excerpt"]), EXTRAIT_MAX)
+
+
+class HandWrittenExcerptTests(TestCase):
+    """Un extrait saisi à la main est un choix éditorial, pas un cache."""
+
+    def test_manual_excerpt_survives_a_body_edit(self):
+        choisi = "Yon chapo ekri alamen pa Florentz."
+        texte = make_text(body="Premye kò a", excerpt=choisi)
+
+        texte.body = "Yon lòt kò nèt"
+        texte.save()
+
+        texte.refresh_from_db()
+        self.assertEqual(texte.excerpt, choisi)

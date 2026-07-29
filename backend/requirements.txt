@@ -1,6 +1,8 @@
 Django==5.2.7
 django-ninja==1.4.3
 psycopg[binary]==3.2.10
+# Freine les tentatives de connexion à l'admin (issue #5).
+django-axes==8.0.0
 # Requis par les ImageField de Django (couvertures de série).
 # Plus utilisé pour générer des images : décision du 27/07/2026.
 Pillow==11.3.0

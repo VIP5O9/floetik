@@ -422,3 +422,68 @@ class RelatedTextsLimitTests(TestCase):
     def test_default_limit_still_works(self):
         response = self.client.get(f"/api/v1/tex/{self.text.slug}/vwazen")
         self.assertEqual(response.status_code, 200)
+
+
+@unittest.skipUnless(
+    connection.vendor == "postgresql", "cheche() utilise unaccent/pg_trgm, indisponible hors PostgreSQL"
+)
+class SearchQueryLengthTests(TestCase):
+    """`q` est interpolé dans six prédicats SQL : son coût est en O(len(q) × lignes).
+    Sans borne, un simple GET anonyme immobilise un backend Postgres plusieurs
+    minutes. La borne est de 200 caractères — littéral écrit à la main ici."""
+
+    def setUp(self):
+        make_text(title="Lanmou", body="pale de lanmou")
+
+    def test_query_of_exactly_200_chars_is_accepted(self):
+        response = self.client.get("/api/v1/cheche", {"q": "a" * 200})
+        self.assertEqual(response.status_code, 200)
+
+    def test_query_of_201_chars_is_rejected(self):
+        response = self.client.get("/api/v1/cheche", {"q": "a" * 201})
+        self.assertEqual(response.status_code, 422)
+
+    def test_single_character_query_still_returns_an_empty_result(self):
+        """Le plancher existant (moins de 2 caractères → rien) survit au plafond :
+        trop court reste un 200 vide, seul le trop long est refusé."""
+        response = self.client.get("/api/v1/cheche", {"q": "a"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["items"], [])
+
+    def test_maximum_is_published_in_the_openapi_schema(self):
+        response = self.client.get("/api/v1/openapi.json")
+        self.assertEqual(response.status_code, 200)
+        params = response.json()["paths"]["/api/v1/cheche"]["get"]["parameters"]
+        q_params = [p for p in params if p["name"] == "q"]
+        self.assertEqual(len(q_params), 1, f"paramètre q introuvable parmi {params}")
+        self.assertEqual(q_params[0]["schema"].get("maxLength"), 200)
+
+
+class PaginationCeilingTests(TestCase):
+    """`?limit` sans plafond amplifie toute attaque et fait surchercher la base.
+    Le plafond est de 100 lignes par page — littéral écrit à la main ici."""
+
+    def setUp(self):
+        make_text()
+
+    def test_limit_of_exactly_100_is_accepted(self):
+        response = self.client.get("/api/v1/tex", {"limit": 100})
+        self.assertEqual(response.status_code, 200)
+
+    def test_limit_of_101_is_rejected(self):
+        response = self.client.get("/api/v1/tex", {"limit": 101})
+        self.assertEqual(response.status_code, 422)
+
+    def test_maxint_limit_is_rejected(self):
+        response = self.client.get("/api/v1/tex", {"limit": 2147483647})
+        self.assertEqual(response.status_code, 422)
+
+    def test_ceiling_is_published_in_the_openapi_schema(self):
+        response = self.client.get("/api/v1/openapi.json")
+        self.assertEqual(response.status_code, 200)
+        params = response.json()["paths"]["/api/v1/tex"]["get"]["parameters"]
+        limit_params = [p for p in params if p["name"] == "limit"]
+        self.assertEqual(
+            len(limit_params), 1, f"paramètre limit introuvable parmi {params}"
+        )
+        self.assertEqual(limit_params[0]["schema"].get("maximum"), 100)

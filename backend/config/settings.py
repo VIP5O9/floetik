@@ -84,5 +84,10 @@ MEDIA_ROOT = BASE_DIR / "media"
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
+# Sans ce plafond, django-ninja accepte ?limit=2147483647 : une seule requête
+# anonyme fait alors remonter tout le corpus, corps compris. 100 lignes par page
+# suffisent à toutes les vues du site et bornent le coût d'un appel public.
+NINJA_PAGINATION_MAX_LIMIT = 100
+
 # Emplacement des sauvegardes du corpus (commande `export_corpus`).
 CORPUS_EXPORT_DIR = env("CORPUS_EXPORT_DIR", default=str(BASE_DIR / "backups"))

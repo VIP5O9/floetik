@@ -174,10 +174,27 @@ def random_text(request):
 
 # ───────────────────────────── Recherche ─────────────────────────────
 
+# `q` part dans six prédicats SQL (unaccent+icontains sur titre et corps, deux
+# noms de thème, deux comparaisons trigrammes) : le coût est en O(len(q) × lignes).
+# Sans plafond, un GET anonyme de 500 000 caractères occupe un backend Postgres
+# plus de huit minutes. 200 caractères laissent passer un vers entier ou une
+# phrase de recherche en kreyòl comme en français ; au-delà, ce n'est plus une
+# recherche. Rejet en 422 plutôt que troncature : tronquer répondrait à une
+# requête que le lecteur n'a pas faite.
+SEARCH_QUERY_MAX_LENGTH = 200
+
 
 @api.get("/cheche", response=list[TextCard], summary="Chercher dans le corpus")
 @paginate(LimitOffsetPagination)
-def search(request, q: str, lang: str | None = None):
+def search(
+    request,
+    q: str = Query(
+        ...,
+        max_length=SEARCH_QUERY_MAX_LENGTH,
+        description="Termes cherchés — 200 caractères au plus",
+    ),
+    lang: str | None = None,
+):
     """Recherche insensible aux accents et tolérante aux fautes.
 
     PostgreSQL n'a pas de dictionnaire pour le créole haïtien : pas de

@@ -571,12 +571,26 @@ class SearchQueryLengthTests(TestCase):
         self.assertEqual(response.json()["items"], [])
 
     def test_maximum_is_published_in_the_openapi_schema(self):
-        response = self.client.get("/api/v1/openapi.json")
+        response = _client_staff(self.client).get("/api/v1/openapi.json")
         self.assertEqual(response.status_code, 200)
         params = response.json()["paths"]["/api/v1/cheche"]["get"]["parameters"]
         q_params = [p for p in params if p["name"] == "q"]
         self.assertEqual(len(q_params), 1, f"paramètre q introuvable parmi {params}")
         self.assertEqual(q_params[0]["schema"].get("maxLength"), 200)
+
+
+def _client_staff(client):
+    """Depuis le durcissement (#5), le schéma OpenAPI n'est plus public : il faut
+    être membre du personnel pour le lire. Les tests qui vérifient que les bornes
+    sont *publiées* dans le schéma doivent donc s'authentifier — la borne elle-même
+    reste vérifiée sans authentification par les tests 422 voisins."""
+    Utilisateur = get_user_model()
+    Utilisateur.objects.filter(username="schema-lecteur").delete()
+    personnel = Utilisateur.objects.create_user(
+        username="schema-lecteur", password="mot-de-passe-de-test-long", is_staff=True
+    )
+    client.force_login(personnel)
+    return client
 
 
 class PaginationCeilingTests(TestCase):
@@ -599,7 +613,7 @@ class PaginationCeilingTests(TestCase):
         self.assertEqual(response.status_code, 422)
 
     def test_ceiling_is_published_in_the_openapi_schema(self):
-        response = self.client.get("/api/v1/openapi.json")
+        response = _client_staff(self.client).get("/api/v1/openapi.json")
         self.assertEqual(response.status_code, 200)
         params = response.json()["paths"]["/api/v1/tex"]["get"]["parameters"]
         limit_params = [p for p in params if p["name"] == "limit"]

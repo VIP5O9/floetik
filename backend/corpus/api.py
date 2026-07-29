@@ -146,7 +146,7 @@ def get_text(request, slug: str):
 
 
 @api.get("/tex/{slug}/vwazen", response=list[TextCard], summary="Textes voisins")
-def related_texts(request, slug: str, limit: int = 4):
+def related_texts(request, slug: str, limit: int = Query(4, ge=1, le=20)):
     text = get_object_or_404(Text.objects.live(), slug=slug)
     qs = (
         _base_qs()
@@ -240,10 +240,23 @@ def _series_out(s: Series) -> dict:
     }
 
 
+def _visible_series_qs():
+    """Une série n'existe publiquement qu'à partir de son premier épisode publié
+    (paru ou programmé). Sans ce filtre, créer la fiche d'une série à venir —
+    titre, couverture, présentation — la rendrait publique avant même qu'un
+    épisode soit programmé, à rebours de tout le soin apporté ailleurs à
+    protéger la surprise (reveal_titles, épisodes programmés sans corps)."""
+    return Series.objects.filter(
+        pk__in=Text.objects.filter(status=Status.PUBLISHED, series__isnull=False).values(
+            "series_id"
+        )
+    )
+
+
 @api.get("/seri", response=list[SeriesOut], summary="Lister les séries")
 def list_series(request, lang: str | None = None):
     now = timezone.now()
-    qs = Series.objects.annotate(
+    qs = _visible_series_qs().annotate(
         _episode_count=Count(
             "texts", filter=Q(texts__status=Status.PUBLISHED, texts__published_at__lte=now)
         ),
@@ -264,7 +277,7 @@ def get_series(request, slug: str):
     Un épisode non paru expose sa date de parution et rien d'autre : ni corps,
     ni slug, et son titre seulement si l'auteur a choisi de le révéler.
     """
-    series = get_object_or_404(Series, slug=slug)
+    series = get_object_or_404(_visible_series_qs(), slug=slug)
 
     episodes: list[EpisodeOut] = []
     for t in series.texts.filter(status=Status.PUBLISHED).order_by("episode_no"):

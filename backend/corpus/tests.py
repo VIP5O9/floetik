@@ -4,16 +4,23 @@ Suite de tests — Jalon 0.
 Chaque test reproduit un bug identifié dans ROADMAP.md avant de le corriger.
 """
 
+import json
+import tempfile
 import unittest
 from datetime import timedelta
+from pathlib import Path
 
+from django.contrib.admin.sites import AdminSite
+from django.contrib.messages.storage.fallback import FallbackStorage
 from django.core.cache import cache
 from django.core.exceptions import ValidationError
+from django.core.management import call_command
 from django.db import connection
-from django.test import TestCase
+from django.test import RequestFactory, TestCase
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
+from .admin import TextAdmin
 from .models import Kind, Language, Series, SeriesKind, Status, Text
 
 
@@ -269,3 +276,149 @@ class ViewCountTests(TestCase):
         text = make_text()
         response = self.client.get(f"/api/v1/tex/{text.slug}", REMOTE_ADDR="203.0.113.5")
         self.assertEqual(response.json()["view_count"], 0)
+
+
+class ExportCorpusTests(TestCase):
+    def _run_export(self, **opts):
+        tmpdir = tempfile.mkdtemp()
+        call_command("export_corpus", out=tmpdir, **opts)
+        stamp_dirs = list(Path(tmpdir).iterdir())
+        self.assertEqual(len(stamp_dirs), 1, f"expected one stamp dir, got {stamp_dirs}")
+        root = stamp_dirs[0]
+        data = json.loads((root / "corpus.json").read_text(encoding="utf-8"))
+        return root, data
+
+    def test_published_only_excludes_unpublished_episodes_from_series_summary(self):
+        series = make_series(n_live=1, n_scheduled=1)
+        _, data = self._run_export(published_only=True)
+        entry = next(s for s in data["series"] if s["slug"] == series.slug)
+        self.assertEqual(len(entry["episodes"]), 1)
+
+    def test_without_published_only_series_summary_includes_all_episodes(self):
+        series = make_series(n_live=1, n_scheduled=1)
+        _, data = self._run_export(published_only=False)
+        entry = next(s for s in data["series"] if s["slug"] == series.slug)
+        self.assertEqual(len(entry["episodes"]), 2)
+
+    def test_title_with_colon_does_not_break_front_matter(self):
+        text = make_text(title="Lèt pou ou: dènye mo")
+        root, _ = self._run_export(published_only=False)
+        front_matter = (root / "tex" / f"{text.slug}.md").read_text(encoding="utf-8")
+        title_line = front_matter.splitlines()[1]
+        self.assertEqual(title_line, f"titre: {json.dumps(text.title)}")
+
+    def test_exporte_le_is_timezone_aware(self):
+        make_text()
+        _, data = self._run_export(published_only=False)
+        self.assertRegex(data["exporte_le"], r"[+-]\d{2}:\d{2}$")
+
+
+class SeriesVisibilityTests(TestCase):
+    def test_series_with_only_a_draft_episode_is_not_listed(self):
+        series = Series.objects.create(
+            title="Sezon fantom", kind=SeriesKind.STORY_SERIES, language=Language.HT
+        )
+        Text.objects.create(
+            kind=Kind.STORY,
+            language=Language.HT,
+            title="Epizòd 1",
+            body="Kò tèks la",
+            series=series,
+            episode_no=1,
+            status=Status.DRAFT,
+        )
+        response = self.client.get("/api/v1/seri")
+        self.assertNotIn(series.slug, [s["slug"] for s in response.json()])
+
+    def test_series_with_no_episodes_at_all_is_not_listed(self):
+        series = Series.objects.create(
+            title="Sezon vid", kind=SeriesKind.STORY_SERIES, language=Language.HT
+        )
+        response = self.client.get("/api/v1/seri")
+        self.assertNotIn(series.slug, [s["slug"] for s in response.json()])
+
+    def test_draft_only_series_detail_is_404(self):
+        series = Series.objects.create(
+            title="Sezon kache", kind=SeriesKind.STORY_SERIES, language=Language.HT
+        )
+        Text.objects.create(
+            kind=Kind.STORY,
+            language=Language.HT,
+            title="Epizòd 1",
+            body="Kò tèks la",
+            series=series,
+            episode_no=1,
+            status=Status.DRAFT,
+        )
+        response = self.client.get(f"/api/v1/seri/{series.slug}")
+        self.assertEqual(response.status_code, 404)
+
+    def test_series_with_a_scheduled_episode_is_listed(self):
+        series = make_series(n_live=0, n_scheduled=1)
+        response = self.client.get("/api/v1/seri")
+        self.assertIn(series.slug, [s["slug"] for s in response.json()])
+
+
+class PublierMaintenantTests(TestCase):
+    def setUp(self):
+        self.admin = TextAdmin(Text, AdminSite())
+        self.factory = RequestFactory()
+
+    def _request(self):
+        request = self.factory.post("/admin/corpus/text/")
+        request.session = {}
+        request._messages = FallbackStorage(request)
+        return request
+
+    def test_already_live_text_is_not_rewritten(self):
+        original_published_at = timezone.now() - timedelta(days=5)
+        live = make_text(published_at=original_published_at)
+        self.admin.publier_maintenant(self._request(), Text.objects.filter(pk=live.pk))
+        live.refresh_from_db()
+        self.assertEqual(live.published_at, original_published_at)
+
+    def test_draft_text_gets_published_now(self):
+        draft = make_text(status=Status.DRAFT, published_at=None)
+        self.admin.publier_maintenant(self._request(), Text.objects.filter(pk=draft.pk))
+        draft.refresh_from_db()
+        self.assertEqual(draft.status, Status.PUBLISHED)
+        self.assertIsNotNone(draft.published_at)
+
+    def test_out_of_order_batch_selection_still_publishes_in_episode_order(self):
+        series = Series.objects.create(
+            title="Sezon lòd", kind=SeriesKind.STORY_SERIES, language=Language.HT
+        )
+        # Créés dans l'ordre chronologique normal (ép. 1 puis ép. 2) : sans tri
+        # explicite par episode_no, l'ordre par défaut du modèle (-created_at)
+        # traiterait ép. 2 en premier et buterait sur le garde-fou d'ordre.
+        ep1 = Text.objects.create(
+            kind=Kind.STORY, language=Language.HT, title="Epizòd 1", body="b",
+            series=series, episode_no=1, status=Status.DRAFT,
+        )
+        ep2 = Text.objects.create(
+            kind=Kind.STORY, language=Language.HT, title="Epizòd 2", body="b",
+            series=series, episode_no=2, status=Status.DRAFT,
+        )
+        qs = Text.objects.filter(pk__in=[ep1.pk, ep2.pk])
+        self.admin.publier_maintenant(self._request(), qs)
+        ep1.refresh_from_db()
+        ep2.refresh_from_db()
+        self.assertEqual(ep1.status, Status.PUBLISHED)
+        self.assertEqual(ep2.status, Status.PUBLISHED)
+
+
+class RelatedTextsLimitTests(TestCase):
+    def setUp(self):
+        self.text = make_text()
+
+    def test_negative_limit_is_rejected_not_a_500(self):
+        response = self.client.get(f"/api/v1/tex/{self.text.slug}/vwazen", {"limit": -1})
+        self.assertEqual(response.status_code, 422)
+
+    def test_oversized_limit_is_rejected(self):
+        response = self.client.get(f"/api/v1/tex/{self.text.slug}/vwazen", {"limit": 1000000})
+        self.assertEqual(response.status_code, 422)
+
+    def test_default_limit_still_works(self):
+        response = self.client.get(f"/api/v1/tex/{self.text.slug}/vwazen")
+        self.assertEqual(response.status_code, 200)

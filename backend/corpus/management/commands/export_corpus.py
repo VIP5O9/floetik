@@ -11,7 +11,6 @@ forme lisible sans Floetik, sans Django et sans base de données.
 """
 
 import json
-from datetime import datetime
 from pathlib import Path
 
 from django.conf import settings
@@ -60,18 +59,23 @@ class Command(BaseCommand):
             payload.append(data)
 
             # Un fichier Markdown par texte : lisible dans n'importe quel éditeur,
-            # dans dix ans, sans aucun outil.
+            # dans dix ans, sans aucun outil. json.dumps() pour les valeurs texte :
+            # un YAML flow scalar valide, qui échappe deux-points/guillemets/accents
+            # sans dépendance supplémentaire — un titre avec un « : » ne casse plus
+            # l'en-tête.
             front = [
                 "---",
-                f"titre: {t.title}",
-                f"type: {t.get_kind_display()}",
-                f"langue: {t.get_language_display()}",
+                f"titre: {json.dumps(t.title)}",
+                f"type: {json.dumps(t.get_kind_display())}",
+                f"langue: {json.dumps(t.get_language_display())}",
             ]
             if t.series:
-                front.append(f"serie: {t.series.title}")
+                front.append(f"serie: {json.dumps(t.series.title)}")
                 front.append(f"episode: {t.episode_no}")
             if t.themes.exists():
-                front.append(f"themes: {', '.join(th.name_ht for th in t.themes.all())}")
+                front.append(
+                    f"themes: {json.dumps(', '.join(th.name_ht for th in t.themes.all()))}"
+                )
             if t.published_at:
                 front.append(f"publie: {t.published_at.date().isoformat()}")
             front.append("---")
@@ -89,8 +93,13 @@ class Command(BaseCommand):
                 "langue": s.get_language_display(),
                 "etat": s.get_status_display(),
                 "description": s.description,
+                # --published-only doit aussi s'appliquer ici : sinon le sommaire
+                # de série révèle les titres des épisodes à venir, exactement ce
+                # que reveal_titles protège côté API publique.
                 "episodes": list(
-                    s.texts.order_by("episode_no").values_list("episode_no", "title")
+                    (s.texts.live() if opts["published_only"] else s.texts)
+                    .order_by("episode_no")
+                    .values_list("episode_no", "title")
                 ),
             }
             for s in Series.objects.all()
@@ -99,7 +108,7 @@ class Command(BaseCommand):
         (root / "corpus.json").write_text(
             json.dumps(
                 {
-                    "exporte_le": datetime.now().isoformat(),
+                    "exporte_le": timezone.localtime().isoformat(),
                     "nombre_de_textes": len(payload),
                     "series": series,
                     "textes": payload,

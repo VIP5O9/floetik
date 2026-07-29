@@ -158,8 +158,18 @@ class TextAdmin(admin.ModelAdmin):
 
     @admin.action(description="Publier maintenant")
     def publier_maintenant(self, request, queryset):
-        n = 0
-        for texte in queryset:
+        # Ordre par épisode : dans un lot mixte (plusieurs épisodes d'une même
+        # série sélectionnés ensemble), publier le n°1 avant le n°2 évite de
+        # buter inutilement sur le garde-fou d'ordre pour un simple problème
+        # de séquence de traitement.
+        n = deja_en_ligne = 0
+        for texte in queryset.order_by("series_id", "episode_no", "created_at"):
+            if texte.is_live:
+                # Ne pas écraser published_at d'un texte déjà en ligne : ça
+                # effacerait sa vraie date de parution et le ferait remonter
+                # en tête du fil sans raison.
+                deja_en_ligne += 1
+                continue
             texte.status = "published"
             texte.published_at = timezone.now()
             try:
@@ -171,6 +181,12 @@ class TextAdmin(admin.ModelAdmin):
             n += 1
         if n:
             self.message_user(request, f"{n} texte(s) publié(s).")
+        if deja_en_ligne:
+            self.message_user(
+                request,
+                f"{deja_en_ligne} texte(s) déjà en ligne, non modifié(s).",
+                level="WARNING",
+            )
 
 
 @admin.register(AudioVersion)

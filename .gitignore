@@ -25,3 +25,7 @@ dist/
 .idea/
 Thumbs.db
 desktop.ini
+
+# venv local, jamais versionné
+backend/.venv/
+backend/.venv

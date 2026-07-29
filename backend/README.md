@@ -39,7 +39,27 @@ python manage.py runserver
 | Adresse | Contenu |
 |---|---|
 | `/admin/` | L'espace de publication de Florentz, en français |
-| `/api/v1/docs` | Documentation OpenAPI interactive |
+| `/api/v1/docs` | Documentation OpenAPI interactive — réservée au compte de Florentz |
+
+## Mise en production
+
+Un seul interrupteur : `DEBUG=False`. Il déclenche d'un coup la redirection
+HTTPS, HSTS (un an, sous-domaines compris) et les cookies `secure`. En
+développement tout reste en http, sans quoi le site local serait injoignable.
+
+Trois choses à ne pas oublier dans le `.env` de production :
+
+- `SECRET_KEY` — obligatoire, sans valeur par défaut. Le site refuse de démarrer
+  sans elle plutôt que de tourner avec une clé qui traînerait dans le dépôt.
+- `CSRF_TRUSTED_ORIGINS` — derrière un proxy TLS, sans elle la connexion à
+  l'admin échoue sans message compréhensible.
+- `LOG_DIR` — les erreurs 500 et les tentatives de connexion refusées y sont
+  écrites dans `floetik.log`. C'est le seul endroit où l'on pourra relire ce qui
+  s'est passé ; `ADMINS` ajoute en plus un courriel.
+
+La connexion à l'admin est freinée par django-axes : cinq échecs depuis la même
+adresse IP et la porte se ferme pour une heure (réponse HTTP 429). Pour rouvrir
+avant l'heure : `python manage.py axes_reset`.
 
 ## API de lecture
 

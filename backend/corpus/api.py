@@ -8,6 +8,7 @@ donc que des GET, et ne sert jamais le corps d'un texte non encore paru.
 import random
 import re
 
+from django.contrib.admin.views.decorators import staff_member_required
 from django.core.cache import cache
 from django.db.models import Count, F, Min, Q
 from django.shortcuts import get_object_or_404
@@ -53,6 +54,10 @@ api = NinjaAPI(
     title="Floetik",
     version="1.0.0",
     description="Le corpus de Florentz Charles — poèmes, romans, histoires, opinions.",
+    # La documentation (Swagger UI et openapi.json) décrit toute la surface de
+    # l'API : c'est la carte de la maison. Elle reste ouverte à Florentz, qui
+    # est déjà connecté à l'admin, mais pas au premier venu.
+    docs_decorator=staff_member_required,
 )
 
 

@@ -16,7 +16,8 @@ from django.core.cache import cache
 from django.core.exceptions import ValidationError
 from django.core.management import call_command
 from django.db import connection
-from django.test import RequestFactory, TestCase
+from django.contrib.auth import get_user_model
+from django.test import RequestFactory, TestCase, override_settings
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
@@ -422,3 +423,263 @@ class RelatedTextsLimitTests(TestCase):
     def test_default_limit_still_works(self):
         response = self.client.get(f"/api/v1/tex/{self.text.slug}/vwazen")
         self.assertEqual(response.status_code, 200)
+
+
+# ---------------------------------------------------------------------------
+# Jalon 1 — durcissement de la production (issue #5)
+# ---------------------------------------------------------------------------
+
+
+def _boot_settings_in_isolation(extra_env, tmpdir):
+    """Importe le module de réglages dans un sous-processus isolé.
+
+    Le paquet `config` est recopié dans `tmpdir` pour que son BASE_DIR pointe
+    sur un répertoire sans fichier `.env` : les variables d'environnement du
+    sous-processus sont alors la seule source de configuration, ce qui permet
+    d'observer un démarrage avec SECRET_KEY réellement absente.
+    """
+    import config
+    import os
+    import shutil
+    import subprocess
+    import sys
+
+    source = Path(config.__file__).resolve().parent
+    # Trace explicite : si un jour ce test lisait un autre arbre que celui sous
+    # test, la sortie du runner le dirait tout de suite.
+    print(f"[test] paquet config sous test : {source}")
+    assert (source / "settings.py").is_file(), f"settings.py introuvable dans {source}"
+
+    copie = Path(tmpdir) / "config"
+    shutil.copytree(source, copie, ignore=shutil.ignore_patterns("__pycache__"))
+    assert not (Path(tmpdir) / ".env").exists()
+
+    backend = source.parent
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in {"SECRET_KEY", "DEBUG", "ALLOWED_HOSTS", "DATABASE_URL"}
+    }
+    env["PYTHONPATH"] = os.pathsep.join([str(tmpdir), str(backend)])
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env.update(extra_env)
+    return subprocess.run(
+        [sys.executable, "-c", "import config.settings"],
+        cwd=tmpdir,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+
+class SecretKeyObligatoireTests(unittest.TestCase):
+    def test_demarrage_sans_secret_key_echoue_avec_un_message_francais(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = _boot_settings_in_isolation({}, tmpdir)
+        self.assertNotEqual(
+            result.returncode, 0, f"le démarrage a réussi sans SECRET_KEY : {result.stdout}"
+        )
+        self.assertIn("SECRET_KEY", result.stderr)
+        self.assertIn("ImproperlyConfigured", result.stderr)
+
+    def test_demarrage_avec_secret_key_reussit(self):
+        """Contrôle : sans ce test, le précédent passerait sur n'importe quelle erreur."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = _boot_settings_in_isolation({"SECRET_KEY": "une-vraie-cle"}, tmpdir)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
+@override_settings(DEBUG=False)
+class DocsNonPubliquesTests(TestCase):
+    """La documentation décrit toute la surface de l'API : elle n'est pas publique."""
+
+    def test_docs_anonyme_est_refuse(self):
+        response = self.client.get("/api/v1/docs")
+        self.assertNotEqual(response.status_code, 200)
+
+    def test_openapi_json_anonyme_est_refuse(self):
+        response = self.client.get("/api/v1/openapi.json")
+        self.assertNotEqual(response.status_code, 200)
+
+    def test_docs_restent_accessibles_a_florentz(self):
+        """Contrôle : la protection ne doit pas condamner la porte pour l'auteur."""
+        User = get_user_model()
+        User.objects.create_superuser(username="florentz", password="mot-de-passe-tres-long")
+        self.client.force_login(User.objects.get(username="florentz"))
+        self.assertEqual(self.client.get("/api/v1/docs").status_code, 200)
+        self.assertEqual(self.client.get("/api/v1/openapi.json").status_code, 200)
+
+
+class AdminLoginFreineTests(TestCase):
+    """Le site n'a qu'un seul compte : deviner son mot de passe doit coûter cher."""
+
+    URL = "/admin/login/"
+    # Seuil fixé par la configuration : 5 échecs, puis la porte se ferme.
+    LIMITE = 5
+
+    def setUp(self):
+        User = get_user_model()
+        self.mot_de_passe = "yon-mo-pas-ki-long-anpil"
+        User.objects.create_superuser(username="florentz", password=self.mot_de_passe)
+
+    def _essai(self, mot_de_passe):
+        return self.client.post(
+            self.URL, {"username": "florentz", "password": mot_de_passe}
+        )
+
+    def test_apres_cinq_echecs_le_bon_mot_de_passe_ne_passe_plus(self):
+        for _ in range(self.LIMITE):
+            self._essai("mauvais")
+        reponse = self._essai(self.mot_de_passe)
+        self.assertNotIn("_auth_user_id", self.client.session)
+        # 429 « Too Many Requests » : la bonne sémantique pour un freinage.
+        self.assertEqual(reponse.status_code, 429)
+
+    def test_un_echec_isole_ne_bloque_pas_florentz(self):
+        """Contrôle : la serrure ne doit pas se refermer sur l'auteur."""
+        self._essai("mauvais")
+        reponse = self._essai(self.mot_de_passe)
+        self.assertEqual(reponse.status_code, 302)
+        self.assertIn("_auth_user_id", self.client.session)
+
+    def test_un_echec_laisse_une_trace_dans_les_journaux(self):
+        with self.assertLogs("axes", level="WARNING") as journaux:
+            self._essai("mauvais")
+        self.assertTrue(
+            any("florentz" in ligne for ligne in journaux.output),
+            f"aucune trace nommant le compte visé : {journaux.output}",
+        )
+
+
+class JournalDeProductionTests(unittest.TestCase):
+    """Un 500 en production doit laisser une trace qu'on peut relire demain."""
+
+    SCRIPT = (
+        "import os, logging, django\n"
+        "os.environ['DJANGO_SETTINGS_MODULE'] = 'config.settings'\n"
+        "django.setup()\n"
+        "logging.getLogger('django.request').error('BOUM-TEST-500')\n"
+        "logging.shutdown()\n"
+    )
+
+    def test_une_erreur_serveur_atterrit_dans_un_fichier_meme_avec_debug_false(self):
+        import os
+        import subprocess
+        import sys
+
+        import config
+
+        source = Path(config.__file__).resolve().parent
+        print(f"[test] paquet config sous test : {source}")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            import shutil
+
+            shutil.copytree(
+                source, Path(tmpdir) / "config", ignore=shutil.ignore_patterns("__pycache__")
+            )
+            journaux = Path(tmpdir) / "journaux"
+            env = dict(os.environ)
+            env.update(
+                SECRET_KEY="une-vraie-cle",
+                DEBUG="False",
+                LOG_DIR=str(journaux),
+                PYTHONPATH=os.pathsep.join([tmpdir, str(source.parent)]),
+                PYTHONDONTWRITEBYTECODE="1",
+            )
+            result = subprocess.run(
+                [sys.executable, "-c", self.SCRIPT],
+                cwd=tmpdir,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            fichiers = sorted(journaux.glob("*")) if journaux.is_dir() else []
+            self.assertTrue(
+                fichiers, f"aucun fichier de journal créé dans {journaux}"
+            )
+            contenu = "\n".join(f.read_text() for f in fichiers if f.is_file())
+        self.assertIn("BOUM-TEST-500", contenu)
+
+
+def _reglages_isoles(extra_env):
+    """Retourne les réglages de sécurité tels qu'ils seraient chargés au boot.
+
+    Passe par un sous-processus : DEBUG est figé au moment de l'import du module
+    de réglages, un override_settings ne dirait rien de la vraie configuration.
+    """
+    import os
+    import shutil
+    import subprocess
+    import sys
+
+    import config
+
+    source = Path(config.__file__).resolve().parent
+    print(f"[test] paquet config sous test : {source}")
+    noms = [
+        "SECURE_SSL_REDIRECT",
+        "SECURE_HSTS_SECONDS",
+        "SECURE_HSTS_INCLUDE_SUBDOMAINS",
+        "SECURE_HSTS_PRELOAD",
+        "SESSION_COOKIE_SECURE",
+        "CSRF_COOKIE_SECURE",
+        "SECURE_PROXY_SSL_HEADER",
+        "CSRF_TRUSTED_ORIGINS",
+    ]
+    script = (
+        "import json, config.settings as s\n"
+        f"noms = {noms!r}\n"
+        "manquants = [n for n in noms if not hasattr(s, n)]\n"
+        "print(json.dumps({'manquants': manquants, "
+        "'valeurs': {n: getattr(s, n, None) for n in noms}}))\n"
+    )
+    with tempfile.TemporaryDirectory() as tmpdir:
+        shutil.copytree(
+            source, Path(tmpdir) / "config", ignore=shutil.ignore_patterns("__pycache__")
+        )
+        env = {k: v for k, v in os.environ.items() if k not in {"DEBUG", "SECRET_KEY"}}
+        env.update(
+            SECRET_KEY="une-vraie-cle",
+            LOG_DIR=str(Path(tmpdir) / "journaux"),
+            PYTHONPATH=os.pathsep.join([tmpdir, str(source.parent)]),
+            PYTHONDONTWRITEBYTECODE="1",
+        )
+        env.update(extra_env)
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=tmpdir, env=env, capture_output=True, text=True,
+        )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+class ReglagesHttpsTests(unittest.TestCase):
+    def test_en_production_le_site_est_strict(self):
+        lu = _reglages_isoles({"DEBUG": "False"})
+        self.assertEqual(lu["manquants"], [])
+        v = lu["valeurs"]
+        self.assertTrue(v["SECURE_SSL_REDIRECT"])
+        self.assertEqual(v["SECURE_HSTS_SECONDS"], 31536000)  # un an
+        self.assertTrue(v["SECURE_HSTS_INCLUDE_SUBDOMAINS"])
+        self.assertTrue(v["SECURE_HSTS_PRELOAD"])
+        self.assertTrue(v["SESSION_COOKIE_SECURE"])
+        self.assertTrue(v["CSRF_COOKIE_SECURE"])
+        self.assertEqual(
+            v["SECURE_PROXY_SSL_HEADER"], ["HTTP_X_FORWARDED_PROTO", "https"]
+        )
+
+    def test_en_developpement_le_site_reste_utilisable_en_http(self):
+        lu = _reglages_isoles({"DEBUG": "True"})
+        v = lu["valeurs"]
+        self.assertFalse(v["SECURE_SSL_REDIRECT"])
+        self.assertEqual(v["SECURE_HSTS_SECONDS"], 0)
+        self.assertFalse(v["SESSION_COOKIE_SECURE"])
+        self.assertFalse(v["CSRF_COOKIE_SECURE"])
+
+    def test_les_origines_csrf_de_confiance_viennent_de_l_environnement(self):
+        lu = _reglages_isoles(
+            {"DEBUG": "False", "CSRF_TRUSTED_ORIGINS": "https://floetik.ht"}
+        )
+        self.assertEqual(lu["valeurs"]["CSRF_TRUSTED_ORIGINS"], ["https://floetik.ht"])

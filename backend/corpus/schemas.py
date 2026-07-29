@@ -36,6 +36,15 @@ class TextCard(Schema):
     episode_no: int | None
     has_audio: bool
 
+    @staticmethod
+    def resolve_has_audio(obj):
+        # obj est soit un Text (routes paginées, servi directement à ninja),
+        # soit le dict construit par _card() (routes non paginées) — le champ
+        # y est déjà calculé.
+        if isinstance(obj, dict):
+            return obj["has_audio"]
+        return hasattr(obj, "audio") and obj.audio.is_live
+
 
 class Neighbour(Schema):
     slug: str

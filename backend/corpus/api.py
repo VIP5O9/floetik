@@ -5,8 +5,13 @@ Aucune écriture : Florentz publie par l'admin, le public lit. Cette API n'expos
 donc que des GET, et ne sert jamais le corps d'un texte non encore paru.
 """
 
-from django.db.models import F, Q
+import random
+import re
+
+from django.core.cache import cache
+from django.db.models import Count, F, Min, Q
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from ninja import NinjaAPI, Query
 from ninja.pagination import LimitOffsetPagination, paginate
 
@@ -19,6 +24,30 @@ from .schemas import (
     TextDetail,
     ThemeOut,
 )
+
+# Une même IP ne recompte pas un texte avant ce délai — absorbe les rechargements
+# en rafale sans faire disparaître de vraies relectures plus tard dans la journée.
+VIEW_DEDUP_WINDOW = 30 * 60  # secondes
+
+BOT_USER_AGENT = re.compile(
+    r"bot|crawl|spider|slurp|preview|monitor|facebookexternalhit|whatsapp|telegram",
+    re.IGNORECASE,
+)
+
+
+def _counts_as_view(request, text: "Text") -> bool:
+    """Faux pour un robot connu ou une IP ayant déjà vu ce texte récemment.
+
+    IP prise sur REMOTE_ADDR : pas de confiance accordée à X-Forwarded-For tant
+    que la topologie de déploiement (proxy Railway/Cloudflare) n'est pas fixée —
+    un en-tête client n'est pas une source fiable d'IP sans ça.
+    """
+    user_agent = request.META.get("HTTP_USER_AGENT", "")
+    if not user_agent or BOT_USER_AGENT.search(user_agent):
+        return False
+    ip = request.META.get("REMOTE_ADDR", "")
+    cache_key = f"vu:{text.pk}:{ip}"
+    return cache.add(cache_key, True, VIEW_DEDUP_WINDOW)
 
 api = NinjaAPI(
     title="Floetik",
@@ -72,13 +101,15 @@ def list_texts(
         qs = qs.filter(themes__slug=theme)
     if series:
         qs = qs.filter(series__slug=series)
-    return [_card(t) for t in qs]
+    return qs
 
 
 @api.get("/tex/{slug}", response=TextDetail, summary="Lire un texte")
 def get_text(request, slug: str):
     text = get_object_or_404(_base_qs(), slug=slug)
-    Text.objects.filter(pk=text.pk).update(view_count=F("view_count") + 1)
+    if _counts_as_view(request, text):
+        Text.objects.filter(pk=text.pk).update(view_count=F("view_count") + 1)
+        text.view_count += 1
 
     previous = nxt = None
     if text.series and text.episode_no:
@@ -106,7 +137,7 @@ def get_text(request, slug: str):
         **_card(text),
         "body": text.body,
         "format": text.format,
-        "view_count": text.view_count + 1,
+        "view_count": text.view_count,
         "available_as_frame": text.available_as_frame,
         "audio": audio,
         "previous": previous,
@@ -128,10 +159,16 @@ def related_texts(request, slug: str, limit: int = 4):
 
 @api.get("/aza", response=TextDetail, summary="Un texte au hasard")
 def random_text(request):
-    """« Yon tèks o aza » — le geste qui fait revenir sur un site de poésie."""
-    text = _base_qs().order_by("?").first()
-    if not text:
+    """« Yon tèks o aza » — le geste qui fait revenir sur un site de poésie.
+
+    Un OFFSET aléatoire évite le scan complet + tri d'ORDER BY RANDOM(), qui
+    grossit avec tout le corpus à chaque appel — une cible facile.
+    """
+    qs = _base_qs()
+    count = qs.count()
+    if not count:
         return api.create_response(request, {"detail": "Corpus vide"}, status=404)
+    text = qs[random.randrange(count)]
     return get_text(request, text.slug)
 
 
@@ -168,7 +205,7 @@ def search(request, q: str, lang: str | None = None):
     )
     if lang:
         qs = qs.filter(language=lang)
-    return [_card(t) for t in qs.distinct()]
+    return qs.distinct()
 
 
 # ───────────────────────────── Thèmes ─────────────────────────────
@@ -183,6 +220,13 @@ def list_themes(request):
 
 
 def _series_out(s: Series) -> dict:
+    # list_series() pré-calcule ces deux champs par annotation SQL pour éviter
+    # un COUNT + un MIN par série ; get_series() (une seule série) se rabat
+    # sur les propriétés du modèle.
+    episode_count = s._episode_count if hasattr(s, "_episode_count") else s.texts.live().count()
+    next_episode_at = (
+        s._next_episode_at if hasattr(s, "_next_episode_at") else s.next_episode_at
+    )
     return {
         "slug": s.slug,
         "title": s.title,
@@ -191,14 +235,23 @@ def _series_out(s: Series) -> dict:
         "description": s.description,
         "status": s.status,
         "cover": s.cover.url if s.cover else None,
-        "episode_count": s.texts.live().count(),
-        "next_episode_at": s.next_episode_at,
+        "episode_count": episode_count,
+        "next_episode_at": next_episode_at,
     }
 
 
 @api.get("/seri", response=list[SeriesOut], summary="Lister les séries")
 def list_series(request, lang: str | None = None):
-    qs = Series.objects.all()
+    now = timezone.now()
+    qs = Series.objects.annotate(
+        _episode_count=Count(
+            "texts", filter=Q(texts__status=Status.PUBLISHED, texts__published_at__lte=now)
+        ),
+        _next_episode_at=Min(
+            "texts__published_at",
+            filter=Q(texts__status=Status.PUBLISHED, texts__published_at__gt=now),
+        ),
+    )
     if lang:
         qs = qs.filter(language=lang)
     return [_series_out(s) for s in qs]

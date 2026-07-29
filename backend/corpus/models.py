@@ -8,6 +8,7 @@ repli linguistique. Le corpus est bilingue, chaque texte ne l'est pas.
 
 import re
 
+from django.contrib.postgres.indexes import GinIndex
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.utils import timezone
@@ -241,6 +242,12 @@ class Text(models.Model):
         indexes = [
             models.Index(fields=["status", "published_at"]),
             models.Index(fields=["language", "kind"]),
+            # Index GIN trigrammes : accélère cheche() (recherche floue par
+            # similarité de trigrammes) sur titre et corps. Sans lui, chaque
+            # recherche fait un scan séquentiel de toute la table. PostgreSQL
+            # uniquement — voir migration 0003 pour le no-op ailleurs.
+            GinIndex(fields=["title"], name="corpus_text_title_trgm_gin", opclasses=["gin_trgm_ops"]),
+            GinIndex(fields=["body"], name="corpus_text_body_trgm_gin", opclasses=["gin_trgm_ops"]),
         ]
 
     def __str__(self):
@@ -347,6 +354,7 @@ class Text(models.Model):
         self.reading_time = max(1, round(words / WORDS_PER_MINUTE))
         if self.status == Status.PUBLISHED and self.published_at is None:
             self.published_at = timezone.now()
+        self.full_clean()
         super().save(*args, **kwargs)
 
 

@@ -7,7 +7,6 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 env = environ.Env(
     DEBUG=(bool, False),
     ALLOWED_HOSTS=(list, ["localhost", "127.0.0.1"]),
-    CORS_ORIGINS=(list, ["http://localhost:3000"]),
 )
 environ.Env.read_env(BASE_DIR / ".env")
 
